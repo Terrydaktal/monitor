@@ -402,7 +402,7 @@ def make_bar(value: float, max_value: float, width: int = 18) -> str:
 
 
 def temp_bar_color(temp: float, warn_limit: float | None, crit_limit: float | None) -> str:
-    if crit_limit is not None and temp >= (crit_limit * 0.9):
+    if crit_limit is not None and temp > (crit_limit * 0.93):
         return "red"
     if warn_limit is not None and temp >= warn_limit:
         return "orange"

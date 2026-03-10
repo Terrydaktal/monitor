@@ -27,6 +27,14 @@
       "prefer_reported": true
     },
     {
+      "name": "WD_BLACK SN8100 Controller (Sensor 1)",
+      "device_regex": "^WD_BLACK SN8100\\b",
+      "sensor_regex": "^Sensor 1$",
+      "warn": 75.0,
+      "crit": 85.0,
+      "prefer_reported": true
+    },
+    {
       "name": "nct6686 Chipset",
       "device_regex": "^nct6686$",
       "sensor_regex": "^Chipset Temperature$",

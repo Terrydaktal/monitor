@@ -6,15 +6,15 @@
       "name": "AMD Ryzen 9 9950X package and CCD temps",
       "device_regex": "^AMD Ryzen 9 9950X\\b",
       "sensor_regex": "^(Tctl|Tccd\\d+)$",
-      "warn": 85.0,
+      "warn": 90.0,
       "crit": 95.0,
-      "prefer_reported": true
+      "prefer_reported": false
     },
     {
       "name": "WD_BLACK SN8100 NVMe",
       "device_regex": "^WD_BLACK SN8100\\b",
       "sensor_regex": "^Composite$",
-      "warn": 75.0,
+      "warn": 80.0,
       "crit": 85.0,
       "prefer_reported": true
     },
@@ -22,8 +22,8 @@
       "name": "WD_BLACK SN8100 NAND (Sensor 2)",
       "device_regex": "^WD_BLACK SN8100\\b",
       "sensor_regex": "^Sensor 2$",
-      "warn": 75.0,
-      "crit": 85.0,
+      "warn": 70.0,
+      "crit": 80.0,
       "prefer_reported": true
     },
     {
@@ -38,8 +38,8 @@
       "name": "nct6686 Chipset",
       "device_regex": "^nct6686$",
       "sensor_regex": "^Chipset Temperature$",
-      "warn": 75.0,
-      "crit": 90.0,
+      "warn": 85.0,
+      "crit": 95.0,
       "prefer_reported": true
     },
     {
@@ -55,8 +55,8 @@
       "device_regex": "^DIMM Thermistor \\(SPD5118\\)$",
       "sensor_regex": "^temp1$",
       "warn": 60.0,
-      "crit": 85.0,
-      "prefer_reported": true
+      "crit": 70.0,
+      "prefer_reported": false
     },
     {
       "name": "Realtek Ethernet Controller",
@@ -96,7 +96,7 @@
       "sensor_regex": "^GPU (Core|Memory)$",
       "warn": 83.0,
       "crit": 90.0,
-      "prefer_reported": true
+      "prefer_reported": false
     }
   ]
 }

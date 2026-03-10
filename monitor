@@ -14,6 +14,7 @@ import re
 import shutil
 import subprocess
 import sys
+import termios
 import time
 from datetime import datetime
 from typing import Any
@@ -28,7 +29,7 @@ COLORS = {
     "cyan": "\033[36m",
     "dim": "\033[2m",
 }
-DEFAULT_THRESHOLD_FILE = Path(__file__).with_name("sensor_thresholds.json")
+DEFAULT_THRESHOLD_FILE = Path(__file__).resolve().with_name("sensor_thresholds.json")
 
 
 def supports_color(no_color_flag: bool) -> bool:
@@ -451,18 +452,6 @@ def load_nvidia_gpu_temps() -> list[dict[str, Any]]:
     return temps
 
 
-def temp_status(temp: float, max_limit: float | None, crit_limit: float | None) -> tuple[str, str]:
-    if crit_limit is not None and temp >= crit_limit:
-        return "CRITICAL", "magenta"
-    if max_limit is not None and temp >= max_limit:
-        return "HIGH", "red"
-    if temp >= 85:
-        return "HOT", "red"
-    if temp >= 70:
-        return "WARM", "yellow"
-    return "OK", "green"
-
-
 def make_bar(value: float, max_value: float, width: int = 18) -> str:
     if max_value <= 0:
         max_value = 1
@@ -472,7 +461,7 @@ def make_bar(value: float, max_value: float, width: int = 18) -> str:
 
 
 def temp_bar_color(temp: float, warn_limit: float | None, crit_limit: float | None) -> str:
-    if crit_limit is not None and temp > (crit_limit * 0.93):
+    if crit_limit is not None and temp >= (crit_limit * 0.98):
         return "red"
     if warn_limit is not None and temp >= warn_limit:
         return "orange"
@@ -583,6 +572,31 @@ def leave_alt_screen() -> None:
     sys.stdout.flush()
 
 
+@contextlib.contextmanager
+def suppress_stdin_echo() -> Any:
+    if not sys.stdin.isatty():
+        yield
+        return
+
+    try:
+        fd = sys.stdin.fileno()
+        original_attrs = termios.tcgetattr(fd)
+    except (OSError, termios.error):
+        yield
+        return
+
+    new_attrs = termios.tcgetattr(fd)
+    new_attrs[3] &= ~termios.ECHO
+    termios.tcsetattr(fd, termios.TCSANOW, new_attrs)
+    try:
+        yield
+    finally:
+        try:
+            termios.tcsetattr(fd, termios.TCSANOW, original_attrs)
+        except (OSError, termios.error):
+            pass
+
+
 def render_once(use_color: bool) -> int:
     payload = run_sensors_json()
     temps, fans = parse_sensors(payload)
@@ -623,15 +637,6 @@ def render_once(use_color: bool) -> int:
         use_color,
     )
 
-    if temps:
-        hottest = temps[0]
-        status, color = temp_status(hottest["temp"], hottest["max"], hottest["crit"])
-        status_text = colorize(status, color, use_color)
-        print(
-            f"Hottest: {hottest['temp']:.1f}C ({status_text}) - "
-            f"{hottest['sensor']} on {hottest['chip']}"
-        )
-
     return 0
 
 
@@ -649,9 +654,16 @@ def main() -> int:
     parser.add_argument(
         "-w",
         "--watch",
+        "--wait",
         type=float,
         metavar="SECONDS",
+        default=1.0,
         help="Refresh continuously every N seconds.",
+    )
+    parser.add_argument(
+        "--once",
+        action="store_true",
+        help="Print one static snapshot and exit.",
     )
     parser.add_argument(
         "--no-color",
@@ -662,26 +674,27 @@ def main() -> int:
 
     use_color = supports_color(args.no_color)
 
-    if args.watch is None:
+    if args.once:
         return render_once(use_color)
 
     if args.watch <= 0:
-        print("Error: --watch must be greater than 0.", file=sys.stderr)
+        print("Error: --watch/--wait must be greater than 0.", file=sys.stderr)
         return 2
 
     if not sys.stdout.isatty():
-        print("Error: --watch needs a TTY so it can redraw in place.", file=sys.stderr)
+        print("Error: default live mode needs a TTY. Use --once for static output.", file=sys.stderr)
         return 2
 
     enter_alt_screen()
     try:
-        while True:
-            frame = build_frame(use_color)
-            sys.stdout.write("\033[H\033[J")
-            sys.stdout.write(frame)
-            sys.stdout.write("\nPress Ctrl+C to stop.\n")
-            sys.stdout.flush()
-            time.sleep(args.watch)
+        with suppress_stdin_echo():
+            while True:
+                frame = build_frame(use_color)
+                sys.stdout.write("\033[H\033[J")
+                sys.stdout.write(frame)
+                sys.stdout.write("\nPress Ctrl+C to stop.\n")
+                sys.stdout.flush()
+                time.sleep(args.watch)
     except KeyboardInterrupt:
         return 0
     finally:

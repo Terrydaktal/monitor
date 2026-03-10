@@ -62,22 +62,30 @@ This project wraps `lm-sensors` JSON output and hwmon/sysfs PWM data into a clea
 
 ## Usage
 
-Run once:
+Default behavior (live mode, 1-second refresh):
 
 ```bash
 ./monitor
 ```
 
+Run once (static snapshot):
+
+```bash
+./monitor --once
+```
+
 Disable ANSI colors:
 
 ```bash
-./monitor --no-color
+./monitor --once --no-color
 ```
 
-Live mode (refresh every second):
+Live mode with custom refresh:
 
 ```bash
 ./monitor --watch 1
+# or
+./monitor --wait 1
 ```
 
 ## Live Mode Behavior
@@ -85,6 +93,7 @@ Live mode (refresh every second):
 - Uses terminal alternate screen buffer for a clean dashboard view.
 - Redraws in-place (no continuous scrolling output).
 - Exit with `Ctrl+C`.
+- Live mode is the default. Use `--once` for non-live output.
 
 ## Threshold Overrides
 
@@ -117,4 +126,3 @@ Example rule:
 - Not all sensors export meaningful min/max/crit values.
 - Some drivers report placeholders (for example `0`, `-273.15`, or unrealistic large sentinels).
 - This tool filters invalid values and uses overrides to fill missing limits where appropriate.
-

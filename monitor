@@ -1,0 +1,619 @@
+#!/usr/bin/env python3
+"""Readable temperature and fan monitor based on lm-sensors JSON output."""
+
+from __future__ import annotations
+
+import argparse
+import contextlib
+import functools
+import io
+import json
+import os
+from pathlib import Path
+import re
+import shutil
+import subprocess
+import sys
+import time
+from datetime import datetime
+from typing import Any
+
+RESET = "\033[0m"
+COLORS = {
+    "green": "\033[32m",
+    "yellow": "\033[33m",
+    "orange": "\033[38;5;208m",
+    "red": "\033[31m",
+    "magenta": "\033[35m",
+    "cyan": "\033[36m",
+    "dim": "\033[2m",
+}
+DEFAULT_THRESHOLD_FILE = Path(__file__).with_name("sensor_thresholds.json")
+
+
+def supports_color(no_color_flag: bool) -> bool:
+    if no_color_flag:
+        return False
+    if os.environ.get("NO_COLOR"):
+        return False
+    return sys.stdout.isatty()
+
+
+def colorize(text: str, color: str, enabled: bool) -> str:
+    if not enabled:
+        return text
+    return f"{COLORS.get(color, '')}{text}{RESET}"
+
+
+def run_sensors_json() -> dict[str, Any]:
+    try:
+        result = subprocess.run(
+            ["sensors", "-j"],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+    except FileNotFoundError:
+        print("Error: 'sensors' command not found. Install lm-sensors.", file=sys.stderr)
+        sys.exit(1)
+    except subprocess.CalledProcessError as exc:
+        print(f"Error: sensors command failed: {exc.stderr.strip()}", file=sys.stderr)
+        sys.exit(1)
+
+    try:
+        return json.loads(result.stdout)
+    except json.JSONDecodeError as exc:
+        print(f"Error: could not parse sensors JSON output: {exc}", file=sys.stderr)
+        sys.exit(1)
+
+
+def valid_limit(value: Any) -> float | None:
+    if not isinstance(value, (int, float)):
+        return None
+    numeric = float(value)
+    # Some drivers report 0 or absurd sentinel values for unavailable limits.
+    if numeric <= 0 or numeric > 1000:
+        return None
+    return numeric
+
+
+@functools.lru_cache(maxsize=8)
+def _load_threshold_overrides_cached(
+    path_str: str, mtime_ns: int
+) -> list[dict[str, Any]]:
+    del mtime_ns  # only used to invalidate cache when file changes
+    path = Path(path_str)
+    raw = json.loads(path.read_text(encoding="utf-8"))
+
+    rules_src: Any
+    if isinstance(raw, dict):
+        rules_src = raw.get("overrides", [])
+    else:
+        rules_src = raw
+
+    rules: list[dict[str, Any]] = []
+    if not isinstance(rules_src, list):
+        return rules
+
+    for rule in rules_src:
+        if not isinstance(rule, dict):
+            continue
+
+        warn_raw = rule.get("warn")
+        crit_raw = rule.get("crit")
+        warn = float(warn_raw) if isinstance(warn_raw, (int, float)) else None
+        crit = float(crit_raw) if isinstance(crit_raw, (int, float)) else None
+        if warn is None and crit is None:
+            continue
+
+        device_regex = rule.get("device_regex", ".*")
+        sensor_regex = rule.get("sensor_regex", ".*")
+        if not isinstance(device_regex, str) or not isinstance(sensor_regex, str):
+            continue
+
+        try:
+            device_re = re.compile(device_regex)
+            sensor_re = re.compile(sensor_regex)
+        except re.error:
+            continue
+
+        prefer_reported = bool(rule.get("prefer_reported", True))
+        rules.append(
+            {
+                "device_re": device_re,
+                "sensor_re": sensor_re,
+                "warn": warn,
+                "crit": crit,
+                "prefer_reported": prefer_reported,
+            }
+        )
+
+    return rules
+
+
+def load_threshold_overrides(path: Path = DEFAULT_THRESHOLD_FILE) -> list[dict[str, Any]]:
+    try:
+        mtime_ns = path.stat().st_mtime_ns
+    except OSError:
+        return []
+
+    try:
+        return _load_threshold_overrides_cached(str(path), mtime_ns)
+    except (OSError, json.JSONDecodeError):
+        return []
+
+
+def apply_threshold_overrides(
+    temps: list[dict[str, Any]], rules: list[dict[str, Any]]
+) -> None:
+    if not rules:
+        return
+
+    for temp in temps:
+        for rule in rules:
+            device_re = rule["device_re"]
+            sensor_re = rule["sensor_re"]
+            if not device_re.search(temp["device"]):
+                continue
+            if not sensor_re.search(temp["sensor"]):
+                continue
+
+            prefer_reported = bool(rule.get("prefer_reported", True))
+            warn = rule.get("warn")
+            crit = rule.get("crit")
+
+            if warn is not None and (not prefer_reported or temp["max"] is None):
+                temp["max"] = float(warn)
+            if crit is not None and (not prefer_reported or temp["crit"] is None):
+                temp["crit"] = float(crit)
+            break
+
+
+@functools.lru_cache(maxsize=1)
+def get_cpu_model_name() -> str:
+    cpuinfo = Path("/proc/cpuinfo")
+    try:
+        for line in cpuinfo.read_text(encoding="utf-8").splitlines():
+            if line.lower().startswith("model name"):
+                parts = line.split(":", 1)
+                if len(parts) == 2 and parts[1].strip():
+                    return parts[1].strip()
+    except OSError:
+        pass
+    return "CPU"
+
+
+@functools.lru_cache(maxsize=1)
+def load_hwmon_entries() -> list[dict[str, str]]:
+    entries: list[dict[str, str]] = []
+    hwmon_root = Path("/sys/class/hwmon")
+    if not hwmon_root.exists():
+        return entries
+
+    for hwmon in hwmon_root.glob("hwmon*"):
+        try:
+            name = (hwmon / "name").read_text(encoding="utf-8").strip()
+        except OSError:
+            continue
+        if not name:
+            continue
+
+        model = ""
+        dev_name = ""
+        device_path = ""
+
+        try:
+            model = (hwmon / "device" / "model").read_text(encoding="utf-8").strip()
+        except OSError:
+            pass
+        try:
+            dev_name = (hwmon / "device" / "name").read_text(encoding="utf-8").strip()
+        except OSError:
+            pass
+        try:
+            device_path = os.path.realpath(hwmon / "device")
+        except OSError:
+            pass
+
+        entries.append(
+            {
+                "name": name,
+                "model": model,
+                "dev_name": dev_name,
+                "device_path": device_path,
+            }
+        )
+
+    return entries
+
+
+def fallback_device_label(entry_name: str, chip: str) -> str:
+    if entry_name == "k10temp":
+        return get_cpu_model_name()
+    if entry_name == "nct6686":
+        return "nct6686"
+    if entry_name == "spd5118":
+        return "DIMM Thermistor (SPD5118)"
+    if entry_name.startswith("mt7921"):
+        return "MediaTek MT7921 Wi-Fi"
+    if entry_name.startswith("r8169"):
+        return "Realtek Ethernet Controller"
+    if entry_name == "nvme":
+        return "NVMe SSD"
+    return chip
+
+
+def resolve_device_name(chip: str) -> str:
+    entries = load_hwmon_entries()
+    chip_lower = chip.lower()
+
+    pci_match = re.search(r"pci-([0-9a-f]{4})$", chip_lower)
+    if pci_match:
+        bus = pci_match.group(1)
+        bdf = f"0000:{bus[:2]}:{bus[2:]}.0"
+        for entry in entries:
+            if bdf in entry.get("device_path", ""):
+                return entry.get("model") or fallback_device_label(entry["name"], chip)
+
+    i2c_match = re.search(r"i2c-(\d+)-([0-9a-f]{2})$", chip_lower)
+    if i2c_match:
+        bus = i2c_match.group(1)
+        addr = i2c_match.group(2)
+        needle = f"i2c-{bus}/{bus}-00{addr}"
+        for entry in entries:
+            if needle in entry.get("device_path", ""):
+                return entry.get("model") or fallback_device_label(entry["name"], chip)
+
+    for entry in entries:
+        name = entry.get("name", "")
+        if chip.startswith(name):
+            return entry.get("model") or fallback_device_label(name, chip)
+
+    base = chip_base_name(chip)
+    for entry in entries:
+        name = entry.get("name", "")
+        if name == base:
+            return entry.get("model") or fallback_device_label(name, chip)
+
+    return chip
+
+
+def chip_base_name(chip: str) -> str:
+    return chip.split("-", 1)[0]
+
+
+def read_int_file(path: Path) -> int | None:
+    try:
+        return int(path.read_text(encoding="utf-8").strip())
+    except (OSError, ValueError):
+        return None
+
+
+def load_pwm_controls() -> dict[tuple[str, int], dict[str, float | int | None]]:
+    controls: dict[tuple[str, int], dict[str, float | int | None]] = {}
+    hwmon_root = Path("/sys/class/hwmon")
+    if not hwmon_root.exists():
+        return controls
+
+    for hwmon in hwmon_root.glob("hwmon*"):
+        try:
+            chip_name = (hwmon / "name").read_text(encoding="utf-8").strip()
+        except OSError:
+            continue
+        if not chip_name:
+            continue
+
+        for path in hwmon.iterdir():
+            match = re.fullmatch(r"pwm(\d+)", path.name)
+            if not match:
+                continue
+
+            channel = int(match.group(1))
+            pwm_value = read_int_file(path)
+            if pwm_value is None:
+                continue
+
+            pwm_max = read_int_file(hwmon / f"pwm{channel}_max")
+            if pwm_max is None or pwm_max <= 0:
+                pwm_max = 255
+
+            enable = read_int_file(hwmon / f"pwm{channel}_enable")
+            percent = max(0.0, min(100.0, (float(pwm_value) / float(pwm_max)) * 100.0))
+
+            controls[(chip_name, channel)] = {
+                "pwm": pwm_value,
+                "max": pwm_max,
+                "percent": percent,
+                "enable": enable,
+            }
+
+    return controls
+
+
+def parse_sensors(payload: dict[str, Any]) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    temps: list[dict[str, Any]] = []
+    fans: list[dict[str, Any]] = []
+
+    for chip, chip_data in payload.items():
+        if not isinstance(chip_data, dict):
+            continue
+
+        adapter = chip_data.get("Adapter", "Unknown")
+
+        for sensor_name, metrics in chip_data.items():
+            if sensor_name == "Adapter" or not isinstance(metrics, dict):
+                continue
+
+            for key, value in metrics.items():
+                if not key.endswith("_input") or not isinstance(value, (int, float)):
+                    continue
+
+                prefix = key[: -len("_input")]
+
+                if key.startswith("temp"):
+                    temps.append(
+                        {
+                            "chip": chip,
+                            "adapter": adapter,
+                            "sensor": sensor_name,
+                            "device": chip,
+                            "temp": float(value),
+                            "max": valid_limit(metrics.get(f"{prefix}_max")),
+                            "crit": valid_limit(metrics.get(f"{prefix}_crit")),
+                        }
+                    )
+                elif key.startswith("fan"):
+                    channel_match = re.fullmatch(r"fan(\d+)", prefix)
+                    fans.append(
+                        {
+                            "chip": chip,
+                            "adapter": adapter,
+                            "sensor": sensor_name,
+                            "device": chip,
+                            "channel": int(channel_match.group(1)) if channel_match else None,
+                            "rpm": int(round(float(value))),
+                            "min": valid_limit(metrics.get(f"{prefix}_min")),
+                        }
+                    )
+
+    temps.sort(key=lambda item: item["temp"], reverse=True)
+    fans.sort(key=lambda item: item["rpm"], reverse=True)
+    return temps, fans
+
+
+def temp_status(temp: float, max_limit: float | None, crit_limit: float | None) -> tuple[str, str]:
+    if crit_limit is not None and temp >= crit_limit:
+        return "CRITICAL", "magenta"
+    if max_limit is not None and temp >= max_limit:
+        return "HIGH", "red"
+    if temp >= 85:
+        return "HOT", "red"
+    if temp >= 70:
+        return "WARM", "yellow"
+    return "OK", "green"
+
+
+def make_bar(value: float, max_value: float, width: int = 18) -> str:
+    if max_value <= 0:
+        max_value = 1
+    ratio = max(0.0, min(1.0, value / max_value))
+    filled = int(round(ratio * width))
+    return "[" + ("#" * filled) + ("." * (width - filled)) + "]"
+
+
+def temp_bar_color(temp: float, warn_limit: float | None, crit_limit: float | None) -> str:
+    if crit_limit is not None and temp >= (crit_limit * 0.9):
+        return "red"
+    if warn_limit is not None and temp >= warn_limit:
+        return "orange"
+    return "green"
+
+
+def format_temp_rows(temps: list[dict[str, Any]], use_color: bool) -> list[list[str]]:
+    rows: list[list[str]] = []
+    for t in temps:
+        warn = f"{t['max']:.1f}C" if t["max"] is not None else "-"
+        crit = f"{t['crit']:.1f}C" if t["crit"] is not None else "-"
+        bar = make_bar(t["temp"], 100.0, width=24)
+        bar = colorize(bar, temp_bar_color(t["temp"], t["max"], t["crit"]), use_color)
+        rows.append(
+            [
+                f"{t['temp']:.1f}C",
+                f"{warn} / {crit}",
+                bar,
+                t["sensor"],
+                t["device"],
+            ]
+        )
+    return rows
+
+
+def format_fan_rows(
+    fans: list[dict[str, Any]], use_color: bool
+) -> list[list[str]]:
+    rows: list[list[str]] = []
+
+    for f in fans:
+        control = f.get("control")
+
+        if isinstance(control, dict):
+            control_pct = float(control["percent"])
+            load_text = f"{make_bar(control_pct, 100.0, width=24)} {control_pct:5.1f}%"
+            control_text = f"{int(control['pwm'])}/{int(control['max'])}"
+        else:
+            load_text = f"{make_bar(0.0, 100.0, width=24)}   n/a"
+            control_text = "-"
+
+        rows.append(
+            [
+                f"{f['rpm']}",
+                load_text,
+                control_text,
+                f["sensor"],
+                f["device"],
+            ]
+        )
+    return rows
+
+
+def print_table(title: str, headers: list[str], rows: list[list[str]], use_color: bool) -> None:
+    print(colorize(title, "cyan", use_color))
+    if not rows:
+        print("  (none found)")
+        print()
+        return
+
+    widths = [len(h) for h in headers]
+    for row in rows:
+        for idx, cell in enumerate(row):
+            plain = strip_ansi(cell)
+            widths[idx] = max(widths[idx], len(plain))
+
+    header_line = "  " + " | ".join(h.ljust(widths[i]) for i, h in enumerate(headers))
+    divider = "  " + "-+-".join("-" * w for w in widths)
+
+    print(header_line)
+    print(divider)
+
+    for row in rows:
+        padded: list[str] = []
+        for i, cell in enumerate(row):
+            plain_len = len(strip_ansi(cell))
+            pad = " " * max(0, widths[i] - plain_len)
+            padded.append(cell + pad)
+        print("  " + " | ".join(padded))
+    print()
+
+
+def strip_ansi(text: str) -> str:
+    out = []
+    i = 0
+    while i < len(text):
+        if text[i] == "\033":
+            i += 1
+            if i < len(text) and text[i] == "[":
+                i += 1
+                while i < len(text) and text[i] != "m":
+                    i += 1
+                i += 1
+            continue
+        out.append(text[i])
+        i += 1
+    return "".join(out)
+
+
+def enter_alt_screen() -> None:
+    # Use terminal alternate buffer to avoid filling scrollback during live refresh.
+    sys.stdout.write("\033[?1049h\033[?25l")
+    sys.stdout.flush()
+
+
+def leave_alt_screen() -> None:
+    sys.stdout.write("\033[?25h\033[?1049l")
+    sys.stdout.flush()
+
+
+def render_once(use_color: bool) -> int:
+    payload = run_sensors_json()
+    temps, fans = parse_sensors(payload)
+    pwm_controls = load_pwm_controls()
+    for item in temps:
+        item["device"] = resolve_device_name(item["chip"])
+    apply_threshold_overrides(temps, load_threshold_overrides())
+    for fan in fans:
+        fan["device"] = resolve_device_name(fan["chip"])
+        channel = fan.get("channel")
+        if isinstance(channel, int):
+            key = (chip_base_name(fan["chip"]), channel)
+            fan["control"] = pwm_controls.get(key)
+        else:
+            fan["control"] = None
+
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    cols = shutil.get_terminal_size((120, 30)).columns
+    print(colorize("Hardware Sensors Dashboard", "cyan", use_color))
+    print(colorize(f"Snapshot: {timestamp}", "dim", use_color))
+    print("=" * min(cols, 100))
+    print()
+
+    print_table(
+        f"Temperatures ({len(temps)})",
+        ["Temp", "Warn/Crit", "Load", "Sensor", "Device"],
+        format_temp_rows(temps, use_color),
+        use_color,
+    )
+
+    print_table(
+        f"Fan Speeds ({len(fans)})",
+        ["RPM", "Load", "Control", "Fan", "Device"],
+        format_fan_rows(fans, use_color),
+        use_color,
+    )
+
+    if temps:
+        hottest = temps[0]
+        status, color = temp_status(hottest["temp"], hottest["max"], hottest["crit"])
+        status_text = colorize(status, color, use_color)
+        print(
+            f"Hottest: {hottest['temp']:.1f}C ({status_text}) - "
+            f"{hottest['sensor']} on {hottest['chip']}"
+        )
+
+    return 0
+
+
+def build_frame(use_color: bool) -> str:
+    frame = io.StringIO()
+    with contextlib.redirect_stdout(frame):
+        render_once(use_color)
+    return frame.getvalue()
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(
+        description="Show a readable dashboard of all temperatures and fan speeds."
+    )
+    parser.add_argument(
+        "-w",
+        "--watch",
+        type=float,
+        metavar="SECONDS",
+        help="Refresh continuously every N seconds.",
+    )
+    parser.add_argument(
+        "--no-color",
+        action="store_true",
+        help="Disable ANSI colors.",
+    )
+    args = parser.parse_args()
+
+    use_color = supports_color(args.no_color)
+
+    if args.watch is None:
+        return render_once(use_color)
+
+    if args.watch <= 0:
+        print("Error: --watch must be greater than 0.", file=sys.stderr)
+        return 2
+
+    if not sys.stdout.isatty():
+        print("Error: --watch needs a TTY so it can redraw in place.", file=sys.stderr)
+        return 2
+
+    enter_alt_screen()
+    try:
+        while True:
+            frame = build_frame(use_color)
+            sys.stdout.write("\033[H\033[J")
+            sys.stdout.write(frame)
+            sys.stdout.write("\nPress Ctrl+C to stop.\n")
+            sys.stdout.flush()
+            time.sleep(args.watch)
+    except KeyboardInterrupt:
+        return 0
+    finally:
+        leave_alt_screen()
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

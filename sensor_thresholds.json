@@ -14,8 +14,8 @@
       "name": "AMD Ryzen 9 9950X CCD sensors",
       "device_regex": "^AMD Ryzen 9 9950X\\b",
       "sensor_regex": "^Tccd\\d+$",
-      "warn": 85.0,
-      "crit": 90.0,
+      "warn": 90.0,
+      "crit": 95.0,
       "prefer_reported": false
     },
     {

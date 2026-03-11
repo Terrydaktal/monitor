@@ -1,4 +1,4 @@
-# monitor
+# temps
 
 Readable Linux hardware monitoring dashboard for temperatures and fan speeds.
 
@@ -15,14 +15,14 @@ This project wraps `lm-sensors` JSON output and hwmon/sysfs PWM data into a clea
 ```text
 .
 ├── .gitignore
-├── monitor
+├── temps
 ├── README.md
 └── sensor_thresholds.json
 ```
 
 ## Files
 
-- `monitor`
+- `temps`
   - Executable Python CLI (no extension).
   - Inputs:
     - `sensors -j` output from `lm-sensors`
@@ -52,7 +52,7 @@ This project wraps `lm-sensors` JSON output and hwmon/sysfs PWM data into a clea
 
 ## Data Pipeline
 
-1. `monitor` executes `sensors -j`.
+1. `temps` executes `sensors -j`.
 2. It parses all `temp*_input` and `fan*_input` entries.
 3. It resolves device names from hwmon sysfs metadata.
 4. It reads PWM control channels (`pwmX`) from `/sys/class/hwmon` and maps them to `fanX`.
@@ -65,27 +65,27 @@ This project wraps `lm-sensors` JSON output and hwmon/sysfs PWM data into a clea
 Default behavior (live mode, 1-second refresh):
 
 ```bash
-./monitor
+./temps
 ```
 
 Run once (static snapshot):
 
 ```bash
-./monitor --once
+./temps --once
 ```
 
 Disable ANSI colors:
 
 ```bash
-./monitor --once --no-color
+./temps --once --no-color
 ```
 
 Live mode with custom refresh:
 
 ```bash
-./monitor --watch 1
+./temps --watch 1
 # or
-./monitor --wait 1
+./temps --wait 1
 ```
 
 ## Live Mode Behavior
